@@ -4,6 +4,37 @@
 
 150 lines Python, zero dependencies, search 20k messages in <2s.
 
+## Installation
+
+```bash
+# Clone
+git clone https://github.com/woolkingx/mcp-claude-history.git
+
+# Add to Claude Code
+claude mcp add claude-history python3 /path/to/mcp-claude-history/server.py
+
+# Or manually edit ~/.claude.json
+```
+
+```json
+{
+  "mcpServers": {
+    "claude-history": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["/path/to/mcp-claude-history/server.py"]
+    }
+  }
+}
+```
+
+## Usage
+
+```
+mcp__claude-history__search_history("your query", 3)
+mcp__claude-history__search_stats()
+```
+
 ## Core Algorithm
 
 ```python
