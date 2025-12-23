@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-150 lines Python, zero dependencies, search 20k messages in <2s.
+240+ lines Python, zero dependencies, search 20k messages in <2s with context navigation.
 
 ## Installation
 
@@ -30,10 +30,28 @@ claude mcp add claude-history python3 /path/to/mcp-claude-history/server.py
 
 ## Usage
 
-```
+```python
+# Search conversation history
 mcp__claude-history__search_history("your query", 3)
+
+# Get statistics
 mcp__claude-history__search_stats()
+
+# Get context around a specific line (new in v1.1)
+mcp__claude-history__get_context(
+    file="860e858e-2203-461e-a2e1-4fccb0611830.jsonl",
+    line=42,
+    context_lines=5  # ±5 lines around target
+)
 ```
+
+### Available Tools
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `search_history` | D-Heap search with co-occurrence ranking | `query: str`, `limit: int = 3` |
+| `search_stats` | Get corpus statistics | None |
+| `get_context` | Retrieve conversation context around specific line | `file: str`, `line: int`, `context_lines: int = 5` |
 
 ## Core Algorithm
 
@@ -125,9 +143,30 @@ def search_dheap(query, messages, d=4, top_n=5):
 
 ## Use Cases
 
-1. **Conversation history search** - Find past discussions
-2. **Code archaeology** - Why was this changed? (Git shows what, this shows why)
-3. **Agent/skill matching** - Match by content, not description
+1. **Conversation history search** - Find past discussions with D-Heap ranking
+2. **Context navigation** - Jump to specific conversation points and explore surrounding context
+3. **Code archaeology** - Why was this changed? (Git shows what, this shows why)
+4. **Agent/skill matching** - Match by content, not description
+
+### Workflow Example
+
+```python
+# 1. Search for relevant conversations
+results = search_history("performance optimization React", 5)
+
+# 2. Navigate to specific result
+context = get_context(
+    file=results[0]['file'],
+    line=results[0]['line'],
+    context_lines=10
+)
+
+# 3. Explore surrounding discussion
+for msg in context['messages']:
+    if msg['is_target']:
+        print(f">>> Found at line {msg['line']}")
+    print(f"{msg['type']}: {msg['content'][:100]}...")
+```
 
 ## License
 
