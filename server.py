@@ -69,7 +69,7 @@ def load_all_messages() -> List[Dict]:
         project = session_file.parent.name
         try:
             with open(session_file, 'r', encoding='utf-8') as f:
-                for line in f:
+                for line_num, line in enumerate(f, 1):
                     try:
                         entry = json.loads(line)
                         msg_type = entry.get('type')
@@ -81,7 +81,9 @@ def load_all_messages() -> List[Dict]:
                                     'project': project,
                                     'type': 'user',
                                     'content': content,
-                                    'session': session_file.stem[:8]
+                                    'session': session_file.stem[:8],
+                                    'file': session_file.name,
+                                    'line': line_num
                                 })
 
                         elif msg_type == 'assistant':
@@ -95,7 +97,9 @@ def load_all_messages() -> List[Dict]:
                                     'project': project,
                                     'type': 'assistant',
                                     'content': text,
-                                    'session': session_file.stem[:8]
+                                    'session': session_file.stem[:8],
+                                    'file': session_file.name,
+                                    'line': line_num
                                 })
                     except:
                         continue
@@ -143,7 +147,9 @@ def search_history(query: str, limit: int = 3) -> List[Dict]:
             'hits': item['hits'],
             'project': item['project'],
             'type': item['type'],
-            'content': item['content'][:500]  # Truncate for response
+            'content': item['content'][:500],  # Truncate for response
+            'file': item['file'],
+            'line': item['line']
         })
 
     return results
@@ -158,6 +164,85 @@ def search_stats() -> Dict:
         'total_messages': len(messages),
         'projects': len(projects),
         'project_list': sorted(projects)
+    }
+
+
+@mcp.tool()
+def get_context(file: str, line: int, context_lines: int = 5) -> Dict:
+    """
+    Get conversation context around a specific line.
+
+    Args:
+        file: Filename (e.g., "860e858e-2203-461e-a2e1-4fccb0611830.jsonl")
+        line: Line number (1-indexed)
+        context_lines: Number of lines before/after to include (default 5)
+
+    Returns:
+        Context with surrounding messages
+    """
+    # Find the file in projects directory
+    target_file = None
+    for session_file in PROJECTS_DIR.glob('*/*.jsonl'):
+        if session_file.name == file:
+            target_file = session_file
+            break
+
+    if not target_file:
+        return {
+            'error': f'File not found: {file}',
+            'searched_in': str(PROJECTS_DIR)
+        }
+
+    # Read context lines
+    start_line = max(1, line - context_lines)
+    end_line = line + context_lines
+
+    context_messages = []
+    try:
+        with open(target_file, 'r', encoding='utf-8') as f:
+            for line_num, json_line in enumerate(f, 1):
+                if start_line <= line_num <= end_line:
+                    try:
+                        entry = json.loads(json_line)
+                        msg_type = entry.get('type')
+
+                        # Extract content based on message type
+                        if msg_type == 'user':
+                            content = entry.get('message', {}).get('content', '')
+                        elif msg_type == 'assistant':
+                            content_items = entry.get('message', {}).get('content', [])
+                            content = ""
+                            for item in content_items:
+                                if isinstance(item, dict):
+                                    if item.get('type') == 'text':
+                                        content += item.get('text', '')
+                                    elif item.get('type') == 'tool_use':
+                                        content += f"\n[Tool: {item.get('name')}]"
+                        else:
+                            content = str(entry.get('message', ''))
+
+                        context_messages.append({
+                            'line': line_num,
+                            'type': msg_type,
+                            'content': content[:1000] if content else '',  # Limit length
+                            'is_target': line_num == line
+                        })
+                    except:
+                        continue
+
+                if line_num > end_line:
+                    break
+    except Exception as e:
+        return {
+            'error': f'Failed to read file: {str(e)}'
+        }
+
+    return {
+        'file': file,
+        'target_line': line,
+        'context_range': f'{start_line}-{end_line}',
+        'messages': context_messages,
+        'total_messages': len(context_messages)
     }
 
 
