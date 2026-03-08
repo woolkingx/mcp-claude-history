@@ -1,10 +1,11 @@
 [project]
 name = "mcp-claude-history"
-version = "0.1.0"
+version = "3.0.0"
 description = "MCP server for searching Claude Code conversation history using D-Heap algorithm"
 requires-python = ">=3.10"
 dependencies = [
     "mcp[cli]>=1.0.0",
+    "orjson>=3.0.0",
 ]
 
 [build-system]

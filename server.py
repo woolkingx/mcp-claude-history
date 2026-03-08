@@ -1,17 +1,66 @@
 #!/usr/bin/env python3
 """
 MCP Claude History - Search Claude Code conversation history
-(D-Heap optimized version: orjson + heap insert on match)
+(D-Heap: d=4 bounded heap, dheap_weight rank decay, orjson)
 
-Usage: python server_dheap.py (stdio mode)
+Usage: python server.py (stdio mode)
 """
 
 import orjson
 import math
-import heapq
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Optional, Tuple
 from itertools import combinations
+
+
+# --- D-ary heap (d=4, min-heap, bounded size) ---
+
+_D = 4  # branching factor
+
+
+def _dh_push(heap: list, item: tuple) -> None:
+    """Push item onto d-ary min-heap."""
+    heap.append(item)
+    _dh_sift_up(heap, len(heap) - 1)
+
+
+def _dh_replace_min(heap: list, item: tuple) -> None:
+    """Replace root (min) with item, restore heap property. Heap must be non-empty."""
+    heap[0] = item
+    _dh_sift_down(heap, 0)
+
+
+def _dh_sift_up(heap: list, i: int) -> None:
+    item = heap[i]
+    while i > 0:
+        parent = (i - 1) // _D
+        if item < heap[parent]:
+            heap[i] = heap[parent]
+            i = parent
+        else:
+            break
+    heap[i] = item
+
+
+def _dh_sift_down(heap: list, i: int) -> None:
+    n = len(heap)
+    item = heap[i]
+    while True:
+        first_child = _D * i + 1
+        if first_child >= n:
+            break
+        # find min child among up to _D children
+        min_child = first_child
+        for c in range(first_child + 1, min(first_child + _D, n)):
+            if heap[c] < heap[min_child]:
+                min_child = c
+        if heap[min_child] < item:
+            heap[i] = heap[min_child]
+            i = min_child
+        else:
+            break
+    heap[i] = item
 
 from mcp.server.fastmcp import FastMCP
 
@@ -63,18 +112,52 @@ def dheap_weight(rank: int, d: int = 4) -> float:
     return 1.0 / (d ** layer)
 
 
+def parse_since(since: Optional[str]) -> Optional[float]:
+    """Parse since string like '7d', '24h', '30m' into a Unix timestamp cutoff."""
+    if not since:
+        return None
+    since = since.strip().lower()
+    units = {'d': 86400, 'h': 3600, 'm': 60}
+    if since[-1] in units:
+        try:
+            delta = float(since[:-1]) * units[since[-1]]
+            return (datetime.now(timezone.utc) - timedelta(seconds=delta)).timestamp()
+        except ValueError:
+            pass
+    return None
+
+
 @mcp.tool()
-def search_history(query: str, limit: int = 3) -> List[Dict]:
+def search_history(
+    query: str,
+    limit: int = 3,
+    since: Optional[str] = None,
+    project: Optional[str] = None,
+) -> List[Dict]:
     """
-    Search Claude Code conversation history using D-Heap algorithm.
-    (Optimized: insert into heap on match, no separate sort step)
+    Search Claude Code conversation history using a d=4 D-Heap algorithm.
+
+    Maintains a fixed-size heap of `limit` entries during scan; each candidate's
+    weighted_score = pair_hits * dheap_weight(heap_size) so the admission threshold
+    rises as the heap fills — only strictly better entries displace the current worst.
 
     Args:
-        query: Search query (Chinese/English mixed)
+        query: Search query. Supports Chinese (char-level) and English (word-level),
+               or mixed. E.g. "transformer attention", "dheap 搜尋", "auth token jwt"
         limit: Max results to return (default 3)
+        since: Restrict to files modified within this window.
+               Format: "<number><unit>" where unit is d/h/m.
+               Examples: "7d" (last 7 days), "24h" (last 24 hours), "30m" (last 30 min)
+        project: Filter by project. Matches against the working directory path (cwd)
+                 or the hashed project directory name. E.g. "myapp", "claude-history"
 
     Returns:
-        List of matching conversations with score and content
+        List of dicts, each with:
+          file    — session filename (pass to get_context)
+          line    — line number within file (pass to get_context)
+          hits    — raw pair co-occurrence count
+          score   — normalized score 0.0–1.0 (hits / max_possible_pairs)
+          snippet — ±100 chars around first token match
     """
     tokens = tokenize(query)
     pairs = create_pairs(tokens)
@@ -83,21 +166,37 @@ def search_history(query: str, limit: int = 3) -> List[Dict]:
     if max_pairs == 0:
         return []
 
-    # D-Heap: max-heap using negative values
-    # Key: (-hits, -mtime, counter, data) for sorting by hits desc, then mtime desc
+    since_ts = parse_since(since)
+    project_lower = project.lower() if project else None
+
+    # Fixed-size min-heap of `limit` entries.
+    # Key: (weighted_score, mtime, counter, data)
+    # weighted_score = hits * dheap_weight(heap_size) — admission threshold rises as heap fills.
+    # Min-heap: smallest weighted_score is evicted when a better entry arrives.
     heap = []
     counter = 0
 
     for session_file in PROJECTS_DIR.glob('*/*.jsonl'):
-        project = session_file.parent.name
-        mtime = session_file.stat().st_mtime  # file modification time
+        project_dir = session_file.parent.name
+        mtime = session_file.stat().st_mtime
+
+        if since_ts and mtime < since_ts:
+            continue
+
+        if project_lower and project_lower not in project_dir.lower():
+            continue
 
         try:
+            cwd = None
             with open(session_file, 'rb') as f:
-                for line_num, line in enumerate(f, 1):
+                for line_num, raw in enumerate(f, 1):
                     try:
-                        entry = orjson.loads(line)
+                        entry = orjson.loads(raw)
                         msg_type = entry.get('type')
+
+                        if cwd is None and entry.get('cwd'):
+                            cwd = entry['cwd']
+
                         content = None
 
                         if msg_type == 'user' and not entry.get('isMeta'):
@@ -117,40 +216,47 @@ def search_history(query: str, limit: int = 3) -> List[Dict]:
                         if content:
                             hits = count_pair_hits(content, pairs)
                             if hits > 0:
+                                # dheap_weight: rank decay — heap near full → weight drops
+                                # → new entry needs higher raw hits to displace current min
+                                weight = dheap_weight(len(heap))
+                                weighted = hits * weight
                                 counter += 1
-                                # Insert into heap: (-hits, -mtime, counter) for max-heap behavior
-                                heapq.heappush(heap, (
-                                    -hits,
-                                    -mtime,
+                                entry_data = (
+                                    weighted,
+                                    mtime,
                                     counter,
                                     {
-                                        'project': project,
+                                        'project': project_dir,
+                                        'cwd': cwd or '',
                                         'type': msg_type,
                                         'content': content,
                                         'session': session_file.stem[:8],
                                         'file': session_file.name,
                                         'line': line_num,
                                         'hits': hits,
-                                        'normalized': hits / max_pairs
+                                        'score': round(hits / max_pairs, 3),
                                     }
-                                ))
-                    except:
+                                )
+                                if len(heap) < limit:
+                                    _dh_push(heap, entry_data)
+                                elif weighted > heap[0][0]:
+                                    _dh_replace_min(heap, entry_data)
+                    except orjson.JSONDecodeError:
                         continue
-        except:
+                    except Exception:
+                        continue
+        except Exception:
             continue
 
-    # Extract top N from heap
-    results = []
-    rank = 0
-    while heap and rank < limit:
-        rank += 1
-        neg_hits, neg_mtime, _, item = heapq.heappop(heap)
+    # heap contains at most `limit` entries; sort descending by weighted_score then mtime
+    heap.sort(key=lambda e: (-e[0], -e[1]))
 
-        # 找 hit 位置，取前後各 100 字
+    # Extract results from sorted heap
+    results = []
+    for weighted_score, mtime_val, _, item in heap:
         content = item['content']
         content_lower = content.lower()
 
-        # 找第一個匹配的 token 位置
         best_pos = 0
         for t1, t2 in pairs:
             pos1 = content_lower.find(t1)
@@ -159,7 +265,6 @@ def search_history(query: str, limit: int = 3) -> List[Dict]:
                 best_pos = min(pos1, pos2)
                 break
 
-        # 取前後各 100 字
         start = max(0, best_pos - 100)
         end = min(len(content), best_pos + 100)
         snippet = content[start:end]
@@ -172,7 +277,8 @@ def search_history(query: str, limit: int = 3) -> List[Dict]:
             'file': item['file'],
             'line': item['line'],
             'hits': item['hits'],
-            'snippet': snippet
+            'score': item['score'],
+            'snippet': snippet,
         })
 
     return results
@@ -180,57 +286,100 @@ def search_history(query: str, limit: int = 3) -> List[Dict]:
 
 @mcp.tool()
 def search_stats() -> Dict:
-    """Get statistics about conversation history"""
-    messages = []
+    """
+    Get corpus-wide statistics about Claude Code conversation history.
+
+    Scans all sessions and returns message counts, token usage totals, and a
+    list of known projects with their working directory paths.
+
+    Returns:
+        total_messages       — user + assistant message count
+        user_messages        — user turn count
+        assistant_messages   — assistant turn count
+        total_input_tokens   — cumulative input tokens across all sessions
+        total_output_tokens  — cumulative output tokens across all sessions
+        projects             — number of distinct project directories
+        project_list         — list of {dir, cwd} for each project
+    """
+    total_user = 0
+    total_assistant = 0
+    total_input_tokens = 0
+    total_output_tokens = 0
     projects = set()
+    cwd_map = {}  # project_dir -> cwd
 
     for session_file in PROJECTS_DIR.glob('*/*.jsonl'):
-        project = session_file.parent.name
-        projects.add(project)
+        project_dir = session_file.parent.name
+        projects.add(project_dir)
         try:
             with open(session_file, 'rb') as f:
-                for line_num, line in enumerate(f, 1):
+                for line in f:
                     try:
                         entry = orjson.loads(line)
                         msg_type = entry.get('type')
 
+                        if entry.get('cwd') and project_dir not in cwd_map:
+                            cwd_map[project_dir] = entry['cwd']
+
                         if msg_type == 'user' and not entry.get('isMeta'):
                             content = entry.get('message', {}).get('content', '')
                             if content and isinstance(content, str) and len(content) > 20:
-                                messages.append(1)
+                                total_user += 1
 
                         elif msg_type == 'assistant':
                             content_items = entry.get('message', {}).get('content', [])
-                            text = ""
-                            for item in content_items:
-                                if isinstance(item, dict) and item.get('type') == 'text':
-                                    text += item.get('text', '')
+                            text = ''.join(
+                                item.get('text', '')
+                                for item in content_items
+                                if isinstance(item, dict) and item.get('type') == 'text'
+                            )
                             if text and len(text) > 50:
-                                messages.append(1)
+                                total_assistant += 1
+                            usage = entry.get('message', {}).get('usage', {})
+                            total_input_tokens += usage.get('input_tokens', 0)
+                            total_output_tokens += usage.get('output_tokens', 0)
                     except:
                         continue
         except:
             continue
 
+    project_info = [
+        {'dir': d, 'cwd': cwd_map.get(d, '')}
+        for d in sorted(projects)
+    ]
+
     return {
-        'total_messages': len(messages),
+        'total_messages': total_user + total_assistant,
+        'user_messages': total_user,
+        'assistant_messages': total_assistant,
+        'total_input_tokens': total_input_tokens,
+        'total_output_tokens': total_output_tokens,
         'projects': len(projects),
-        'project_list': sorted(projects)
+        'project_list': project_info,
     }
 
 
 @mcp.tool()
 def get_context(file: str, line: int, context_lines: int = 5) -> Dict:
     """
-    Get conversation context around a specific line.
+    Get conversation context around a specific line in a session file.
+
+    Use the `file` and `line` values returned by search_history to retrieve
+    the surrounding messages for a search hit.
 
     Args:
-        file: Filename (e.g., "860e858e-2203-461e-a2e1-4fccb0611830.jsonl")
-        line: Line number (1-indexed)
-        context_lines: Number of lines before/after to include (default 5)
+        file: Session filename from search_history result,
+              e.g. "860e858e-2203-461e-a2e1-4fccb0611830.jsonl"
+        line: Line number (1-indexed) from search_history result
+        context_lines: Number of messages before and after the target line
+                       to include (default 5, i.e. up to 11 messages total)
 
     Returns:
-        Context with surrounding messages
+        file           — session filename
+        target_line    — the requested line number
+        context_range  — actual line range read, e.g. "37-47"
+        messages       — list of {line, type, content, is_target}
+        total_messages — number of messages returned
     """
     target_file = None
     for session_file in PROJECTS_DIR.glob('*/*.jsonl'):
@@ -266,7 +415,9 @@ def get_context(file: str, line: int, context_lines: int = 5) -> Dict:
                                     if item.get('type') == 'text':
                                         content += item.get('text', '')
                                     elif item.get('type') == 'tool_use':
-                                        content += f"\n[Tool: {item.get('name')}]"
+                                        tool_input = item.get('input', {})
+                                        input_str = orjson.dumps(tool_input).decode()[:200]
+                                        content += f"\n[Tool: {item.get('name')} {input_str}]"
                         else:
                             content = str(entry.get('message', ''))
 
