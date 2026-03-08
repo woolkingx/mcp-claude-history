@@ -1,8 +1,10 @@
-# D-Heap Search: Lightweight Conversation History Search
+# mcp-claude-history
+
+Lightweight MCP server for searching Claude Code conversation history.
 
 ## TL;DR
 
-250 lines Python, search 20k messages in ~3.5s with orjson + heap optimization.
+Single-file Python server. True d=4 D-ary heap with rank decay — bounded memory, faster push than binary heap. Search 20k+ messages with `orjson` I/O.
 
 ## Installation
 
@@ -10,96 +12,99 @@
 # Clone
 git clone https://github.com/woolkingx/mcp-claude-history.git
 
-# Install dependency
-pip install orjson
+# Install dependencies
+pip install orjson mcp
+# or:
+pip install -e .
 
 # Add to Claude Code
 claude mcp add claude-history python3 /path/to/mcp-claude-history/server.py
 ```
 
-## Usage
-
-```python
-# Search conversation history
-mcp__claude-history__search_history("your query", 3)
-
-# Returns: file:line:hits | snippet (hit point ±100 chars)
-
-# Get statistics
-mcp__claude-history__search_stats()
-
-# Get context around a specific line
-mcp__claude-history__get_context(
-    file="860e858e-2203-461e-a2e1-4fccb0611830.jsonl",
-    line=42,
-    context_lines=5
-)
-```
-
-### Available Tools
+## Tools
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
-| `search_history` | D-Heap search with co-occurrence ranking | `query: str`, `limit: int = 3` |
-| `search_stats` | Get corpus statistics | None |
-| `get_context` | Retrieve conversation context around specific line | `file: str`, `line: int`, `context_lines: int = 5` |
+| `search_history` | Search by token-pair co-occurrence, ranked by D-Heap | `query: str`, `limit: int = 3`, `since: str?`, `project: str?` |
+| `search_stats` | Corpus statistics (message counts, token usage, projects) | — |
+| `get_context` | Read surrounding messages around a search hit | `file: str`, `line: int`, `context_lines: int = 5` |
 
-## Core Algorithm
+### search_history
+
+```
+query   — Chinese (char-level) or English (word-level) or mixed
+limit   — max results (default 3)
+since   — time window: "7d", "24h", "30m"
+project — filter by project name or cwd path substring
+```
+
+Returns per result:
+```
+file    — session filename (pass to get_context)
+line    — line number within file
+hits    — raw pair co-occurrence count
+score   — normalized 0.0–1.0 (hits / max_possible_pairs)
+snippet — ±100 chars around first token match
+```
+
+### get_context
+
+```
+file          — filename from search_history result
+line          — line number from search_history result
+context_lines — messages before/after to include (default 5, up to 11 total)
+```
+
+## Algorithm
 
 ```python
-# 1. Tokenize: Chinese → chars, English → words
-tokens = tokenize(query)  # ["softmax", "transformer", "核", "心"]
+# 1. Tokenize: CJK → chars, English → words (max 10, deduped)
+tokens = tokenize(query)  # ["softmax", "transformer", "注", "意", "力"]
 
-# 2. Create pairs (implicit Q·K)
-pairs = combinations(tokens, 2)  # 28 pairs
+# 2. Generate token pairs (implicit Q·K)
+pairs = combinations(tokens, 2)  # C(5,2) = 10 pairs
 
-# 3. Count co-occurrence + insert into heap on match
-hits = sum(1 for t1, t2 in pairs if t1 in doc and t2 in doc)
-if hits > 0:
-    heapq.heappush(heap, (-hits, -mtime, counter, item))
+# 3. Scan JSONL: count pair hits per line
+hits = sum(1 for t1, t2 in pairs if t1 in content and t2 in content)
 
-# 4. Sort: hits desc, then mtime desc (newer first)
+# 4. D-ary heap (d=4), bounded to `limit` entries
+#    weighted_score = hits * dheap_weight(heap_size)
+#    → admission threshold rises as heap fills
+if len(heap) < limit:
+    _dh_push(heap, (weighted_score, mtime, counter, item))
+elif weighted_score > heap[0][0]:
+    _dh_replace_min(heap, (weighted_score, mtime, counter, item))
+
+# 5. Sort top-N by score desc, mtime desc
+heap.sort(key=lambda e: (-e[0], -e[1]))
 ```
+
+**dheap_weight(k)**: rank decay — `1 / (4 ** layer)` where layer = `floor(log_4(k))`.
+Heap size 0–3 → weight 1.0. Size 4+ → weight 0.25. Later entries need 4× hits to displace.
+
+**Why d=4**: push-heavy workload (one push per hit, few pops). `log_4(n)` sift-up layers vs `log_2(n)` in binary heap — fewer comparisons where it matters.
 
 ## Why It Works
 
 | Concept | Transformer | D-Heap |
 |---------|-------------|--------|
 | Similarity | Q·K^T (explicit) | Co-occurrence (implicit) |
-| Weights | softmax(scores) | 1/d^layer |
-| Parameters | Q,K,V matrices | **Zero** |
-| Complexity | O(n²) | O(n) |
+| Weights | softmax(scores) | dheap_weight (rank decay) |
+| Parameters | Q, K, V matrices | Zero |
+| Complexity | O(n²) | O(n · limit) |
 
-**Key insight**: Pair co-occurrence = implicit Self-Attention. Document content itself is the Key matrix.
-
-## Benchmark
-
-```
-Query: "D-Heap 搜索 優化"
-
-| Version | Time    | Speedup | Result Quality |
-|---------|---------|---------|----------------|
-| v1 json | 9200ms  | 1.0x    | Old conversations |
-| v2 orjson+heap | 3500ms | 2.6x | Latest conversations |
-```
-
-- 2.6x faster (orjson)
-- Better results (mtime sorting, newer first)
-- Precise snippets (hit point ±100 chars)
-
-## Changes in v2
-
-- **orjson**: Replace json with orjson for 2.6x speedup
-- **Heap insert**: Insert into heap on match, no separate sort step
-- **mtime sorting**: Same hits → newer conversation first
-- **Snippet**: Return hit point ±100 chars instead of content[:500]
+Pair co-occurrence = implicit self-attention. Document content is the key matrix.
 
 ## Use Cases
 
-1. **Conversation history search** - Find past discussions with D-Heap ranking
-2. **Context navigation** - Jump to specific conversation points and explore surrounding context
-3. **Code archaeology** - Why was this changed? (Git shows what, this shows why)
-4. **Agent/skill matching** - Match by content, not description
+1. **Recall past solutions** — find how you solved a similar problem last month
+2. **Context navigation** — jump to a specific conversation point, read surrounding messages
+3. **Code archaeology** — git shows what changed; this shows why
+4. **Cross-project search** — search across all projects, or filter by `project=`
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
