@@ -137,9 +137,13 @@ def search_history(
     """
     Search Claude Code conversation history using a d=4 D-Heap algorithm.
 
+    Scoring unit is the session (entire JSONL file): pair hits are accumulated
+    across all user/assistant messages. The line returned points to the
+    highest-hit message within the session — use it as the get_context entry point.
+
     Maintains a fixed-size heap of `limit` entries during scan; each candidate's
-    weighted_score = pair_hits * dheap_weight(heap_size) so the admission threshold
-    rises as the heap fills — only strictly better entries displace the current worst.
+    weighted_score = session_hits * dheap_weight(heap_size) so the admission threshold
+    rises as the heap fills — only strictly better sessions displace the current worst.
 
     Args:
         query: Search query. Supports Chinese (char-level) and English (word-level),
@@ -154,10 +158,10 @@ def search_history(
     Returns:
         List of dicts, each with:
           file    — session filename (pass to get_context)
-          line    — line number within file (pass to get_context)
-          hits    — raw pair co-occurrence count
-          score   — normalized score 0.0–1.0 (hits / max_possible_pairs)
-          snippet — ±100 chars around first token match
+          line    — highest-hit line in session (pass to get_context)
+          hits    — total pair co-occurrence count across entire session
+          score   — session hits / max_possible_pairs (>1.0 = repeated co-occurrence)
+          snippet — ±100 chars around the best-hit line
     """
     tokens = tokenize(query)
     pairs = create_pairs(tokens)
@@ -188,6 +192,11 @@ def search_history(
 
         try:
             cwd = None
+            session_hits = 0
+            best_line = 1
+            best_hits = 0
+            best_content = ''
+
             with open(session_file, 'rb') as f:
                 for line_num, raw in enumerate(f, 1):
                     try:
@@ -219,36 +228,41 @@ def search_history(
 
                         if content:
                             hits = count_pair_hits(content, pairs)
-                            if hits > 0:
-                                # dheap_weight: rank decay — heap near full → weight drops
-                                # → new entry needs higher raw hits to displace current min
-                                weight = dheap_weight(len(heap))
-                                weighted = hits * weight
-                                counter += 1
-                                entry_data = (
-                                    weighted,
-                                    mtime,
-                                    counter,
-                                    {
-                                        'project': project_dir,
-                                        'cwd': cwd or '',
-                                        'type': msg_type,
-                                        'content': content,
-                                        'session': session_file.stem[:8],
-                                        'file': session_file.name,
-                                        'line': line_num,
-                                        'hits': hits,
-                                        'score': round(hits / max_pairs, 3),
-                                    }
-                                )
-                                if len(heap) < limit:
-                                    _dh_push(heap, entry_data)
-                                elif weighted > heap[0][0]:
-                                    _dh_replace_min(heap, entry_data)
+                            session_hits += hits
+                            # track the line with most hits as get_context entry point
+                            if hits > best_hits:
+                                best_hits = hits
+                                best_line = line_num
+                                best_content = content
+
                     except orjson.JSONDecodeError:
                         continue
                     except Exception:
                         continue
+
+            # score the session as a whole
+            if session_hits > 0:
+                weight = dheap_weight(len(heap))
+                weighted = session_hits * weight
+                counter += 1
+                entry_data = (
+                    weighted,
+                    mtime,
+                    counter,
+                    {
+                        'project': project_dir,
+                        'cwd': cwd or '',
+                        'file': session_file.name,
+                        'line': best_line,
+                        'hits': session_hits,
+                        'score': round(session_hits / max_pairs, 3),
+                        'content': best_content,
+                    }
+                )
+                if len(heap) < limit:
+                    _dh_push(heap, entry_data)
+                elif weighted > heap[0][0]:
+                    _dh_replace_min(heap, entry_data)
         except Exception:
             continue
 
