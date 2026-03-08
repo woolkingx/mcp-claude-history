@@ -191,24 +191,25 @@ def search_history(
             continue
 
         try:
-            cwd = None
             session_hits = 0
             best_line = 1
             best_hits = 0
             best_content = ''
+            pre_filter_active = False
 
             with open(session_file, 'rb') as f:
                 for line_num, raw in enumerate(f, 1):
                     try:
-                        # bytes pre-filter: skip non-user/assistant lines without parsing
-                        if cwd is not None and b'"user"' not in raw and b'"assistant"' not in raw:
+                        # bytes pre-filter: once past the header lines, skip non-user/assistant
+                        if pre_filter_active and b'"user"' not in raw and b'"assistant"' not in raw:
                             continue
 
                         entry = orjson.loads(raw)
                         msg_type = entry.get('type')
 
-                        if cwd is None and entry.get('cwd'):
-                            cwd = entry['cwd']
+                        # activate pre-filter after first entry with cwd (past header)
+                        if not pre_filter_active and entry.get('cwd'):
+                            pre_filter_active = True
 
                         content = None
 
@@ -251,11 +252,9 @@ def search_history(
                     counter,
                     {
                         'project': project_dir,
-                        'cwd': cwd or '',
                         'file': session_file.name,
                         'line': best_line,
                         'hits': session_hits,
-                        'score': round(session_hits / max_pairs, 3),
                         'content': best_content,
                     }
                 )
@@ -292,10 +291,11 @@ def search_history(
             snippet = snippet + '...'
 
         results.append({
+            'project': item['project'],
             'file': item['file'],
             'line': item['line'],
             'hits': item['hits'],
-            'score': item['score'],
+            'score': round(weighted_score, 3),
             'snippet': snippet,
         })
 
@@ -378,12 +378,12 @@ def search_stats() -> Dict:
 
 
 @mcp.tool()
-def get_context(file: str, line: int, context_lines: int = 5) -> Dict:
+def get_context(file: str, line: int, context_lines: int = 5, project: Optional[str] = None) -> Dict:
     """
     Get conversation context around a specific line in a session file.
 
-    Use the `file` and `line` values returned by search_history to retrieve
-    the surrounding messages for a search hit.
+    Use the `file`, `line`, and `project` values returned by search_history.
+    Providing `project` skips the directory scan and goes directly to the file.
 
     Args:
         file: Session filename from search_history result,
@@ -391,6 +391,8 @@ def get_context(file: str, line: int, context_lines: int = 5) -> Dict:
         line: Line number (1-indexed) from search_history result
         context_lines: Number of messages before and after the target line
                        to include (default 5, i.e. up to 11 messages total)
+        project: Project directory name from search_history result (e.g. "-home-user-myapp").
+                 Pass this to avoid scanning all session files.
 
     Returns:
         file           — session filename
@@ -399,17 +401,21 @@ def get_context(file: str, line: int, context_lines: int = 5) -> Dict:
         messages       — list of {line, type, content, is_target}
         total_messages — number of messages returned
     """
-    target_file = None
-    for session_file in PROJECTS_DIR.glob('*/*.jsonl'):
-        if session_file.name == file:
-            target_file = session_file
-            break
-
-    if not target_file:
-        return {
-            'error': f'File not found: {file}',
-            'searched_in': str(PROJECTS_DIR)
-        }
+    if project:
+        target_file = PROJECTS_DIR / project / file
+        if not target_file.exists():
+            return {'error': f'File not found: {project}/{file}'}
+    else:
+        target_file = None
+        for session_file in PROJECTS_DIR.glob('*/*.jsonl'):
+            if session_file.name == file:
+                target_file = session_file
+                break
+        if not target_file:
+            return {
+                'error': f'File not found: {file}',
+                'searched_in': str(PROJECTS_DIR)
+            }
 
     start_line = max(1, line - context_lines)
     end_line = line + context_lines
