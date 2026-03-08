@@ -191,6 +191,10 @@ def search_history(
             with open(session_file, 'rb') as f:
                 for line_num, raw in enumerate(f, 1):
                     try:
+                        # bytes pre-filter: skip non-user/assistant lines without parsing
+                        if cwd is not None and b'"user"' not in raw and b'"assistant"' not in raw:
+                            continue
+
                         entry = orjson.loads(raw)
                         msg_type = entry.get('type')
 
