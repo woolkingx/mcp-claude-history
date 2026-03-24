@@ -1,6 +1,6 @@
 [project]
 name = "mcp-claude-history"
-version = "3.0.0"
+version = "3.1.0"
 description = "MCP server for searching Claude Code conversation history using D-Heap algorithm"
 requires-python = ">=3.10"
 dependencies = [

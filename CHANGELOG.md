@@ -1,5 +1,18 @@
 # Changelog
 
+## v3.1.0 (2026-03-09)
+
+### Algorithm
+- Scoring unit changed from **line** to **session**: hits accumulated across all messages in a session
+- `line` in result now points to the highest-hit message within the session — natural `get_context` entry point
+- Cross-message relevance captured: user asks X, assistant answers X → both contribute to session score
+- `score` field now reflects session-level density (session_hits / max_pairs); values > 1.0 indicate repeated co-occurrence across the session
+- bytes pre-filter (`b'"user"' not in raw`) applied before `orjson.loads` — skips summary/tool/system lines without JSON parse
+
+### Workflow
+- Natural search flow enforced: **session → line → content** (was: line → session)
+- `search_history` returns best session, `get_context` navigates into it
+
 ## v3.0.0 (2026-03-09)
 
 ### Algorithm (Breaking)

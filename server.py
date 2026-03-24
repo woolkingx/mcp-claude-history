@@ -137,9 +137,13 @@ def search_history(
     """
     Search Claude Code conversation history using a d=4 D-Heap algorithm.
 
+    Scoring unit is the session (entire JSONL file): pair hits are accumulated
+    across all user/assistant messages. The line returned points to the
+    highest-hit message within the session — use it as the get_context entry point.
+
     Maintains a fixed-size heap of `limit` entries during scan; each candidate's
-    weighted_score = pair_hits * dheap_weight(heap_size) so the admission threshold
-    rises as the heap fills — only strictly better entries displace the current worst.
+    weighted_score = session_hits * dheap_weight(heap_size) so the admission threshold
+    rises as the heap fills — only strictly better sessions displace the current worst.
 
     Args:
         query: Search query. Supports Chinese (char-level) and English (word-level),
@@ -154,10 +158,10 @@ def search_history(
     Returns:
         List of dicts, each with:
           file    — session filename (pass to get_context)
-          line    — line number within file (pass to get_context)
-          hits    — raw pair co-occurrence count
-          score   — normalized score 0.0–1.0 (hits / max_possible_pairs)
-          snippet — ±100 chars around first token match
+          line    — highest-hit line in session (pass to get_context)
+          hits    — total pair co-occurrence count across entire session
+          score   — session hits / max_possible_pairs (>1.0 = repeated co-occurrence)
+          snippet — ±100 chars around the best-hit line
     """
     tokens = tokenize(query)
     pairs = create_pairs(tokens)
@@ -187,15 +191,25 @@ def search_history(
             continue
 
         try:
-            cwd = None
+            session_hits = 0
+            best_line = 1
+            best_hits = 0
+            best_content = ''
+            pre_filter_active = False
+
             with open(session_file, 'rb') as f:
                 for line_num, raw in enumerate(f, 1):
                     try:
+                        # bytes pre-filter: once past the header lines, skip non-user/assistant
+                        if pre_filter_active and b'"user"' not in raw and b'"assistant"' not in raw:
+                            continue
+
                         entry = orjson.loads(raw)
                         msg_type = entry.get('type')
 
-                        if cwd is None and entry.get('cwd'):
-                            cwd = entry['cwd']
+                        # activate pre-filter after first entry with cwd (past header)
+                        if not pre_filter_active and entry.get('cwd'):
+                            pre_filter_active = True
 
                         content = None
 
@@ -215,36 +229,39 @@ def search_history(
 
                         if content:
                             hits = count_pair_hits(content, pairs)
-                            if hits > 0:
-                                # dheap_weight: rank decay — heap near full → weight drops
-                                # → new entry needs higher raw hits to displace current min
-                                weight = dheap_weight(len(heap))
-                                weighted = hits * weight
-                                counter += 1
-                                entry_data = (
-                                    weighted,
-                                    mtime,
-                                    counter,
-                                    {
-                                        'project': project_dir,
-                                        'cwd': cwd or '',
-                                        'type': msg_type,
-                                        'content': content,
-                                        'session': session_file.stem[:8],
-                                        'file': session_file.name,
-                                        'line': line_num,
-                                        'hits': hits,
-                                        'score': round(hits / max_pairs, 3),
-                                    }
-                                )
-                                if len(heap) < limit:
-                                    _dh_push(heap, entry_data)
-                                elif weighted > heap[0][0]:
-                                    _dh_replace_min(heap, entry_data)
+                            session_hits += hits
+                            # track the line with most hits as get_context entry point
+                            if hits > best_hits:
+                                best_hits = hits
+                                best_line = line_num
+                                best_content = content
+
                     except orjson.JSONDecodeError:
                         continue
                     except Exception:
                         continue
+
+            # score the session as a whole
+            if session_hits > 0:
+                weight = dheap_weight(len(heap))
+                weighted = session_hits * weight
+                counter += 1
+                entry_data = (
+                    weighted,
+                    mtime,
+                    counter,
+                    {
+                        'project': project_dir,
+                        'file': session_file.name,
+                        'line': best_line,
+                        'hits': session_hits,
+                        'content': best_content,
+                    }
+                )
+                if len(heap) < limit:
+                    _dh_push(heap, entry_data)
+                elif weighted > heap[0][0]:
+                    _dh_replace_min(heap, entry_data)
         except Exception:
             continue
 
@@ -274,10 +291,11 @@ def search_history(
             snippet = snippet + '...'
 
         results.append({
+            'project': item['project'],
             'file': item['file'],
             'line': item['line'],
             'hits': item['hits'],
-            'score': item['score'],
+            'score': round(weighted_score, 3),
             'snippet': snippet,
         })
 
@@ -360,12 +378,12 @@ def search_stats() -> Dict:
 
 
 @mcp.tool()
-def get_context(file: str, line: int, context_lines: int = 5) -> Dict:
+def get_context(file: str, line: int, context_lines: int = 5, project: Optional[str] = None) -> Dict:
     """
     Get conversation context around a specific line in a session file.
 
-    Use the `file` and `line` values returned by search_history to retrieve
-    the surrounding messages for a search hit.
+    Use the `file`, `line`, and `project` values returned by search_history.
+    Providing `project` skips the directory scan and goes directly to the file.
 
     Args:
         file: Session filename from search_history result,
@@ -373,6 +391,8 @@ def get_context(file: str, line: int, context_lines: int = 5) -> Dict:
         line: Line number (1-indexed) from search_history result
         context_lines: Number of messages before and after the target line
                        to include (default 5, i.e. up to 11 messages total)
+        project: Project directory name from search_history result (e.g. "-home-user-myapp").
+                 Pass this to avoid scanning all session files.
 
     Returns:
         file           — session filename
@@ -381,17 +401,21 @@ def get_context(file: str, line: int, context_lines: int = 5) -> Dict:
         messages       — list of {line, type, content, is_target}
         total_messages — number of messages returned
     """
-    target_file = None
-    for session_file in PROJECTS_DIR.glob('*/*.jsonl'):
-        if session_file.name == file:
-            target_file = session_file
-            break
-
-    if not target_file:
-        return {
-            'error': f'File not found: {file}',
-            'searched_in': str(PROJECTS_DIR)
-        }
+    if project:
+        target_file = PROJECTS_DIR / project / file
+        if not target_file.exists():
+            return {'error': f'File not found: {project}/{file}'}
+    else:
+        target_file = None
+        for session_file in PROJECTS_DIR.glob('*/*.jsonl'):
+            if session_file.name == file:
+                target_file = session_file
+                break
+        if not target_file:
+            return {
+                'error': f'File not found: {file}',
+                'searched_in': str(PROJECTS_DIR)
+            }
 
     start_line = max(1, line - context_lines)
     end_line = line + context_lines
