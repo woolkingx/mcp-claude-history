@@ -4,7 +4,7 @@ Lightweight MCP server for searching Claude Code conversation history.
 
 ## TL;DR
 
-Single-file Python server. Session-block scoring with true d=4 D-ary heap — finds the most relevant conversation, not just a line. Search 20k+ messages with `orjson` I/O.
+Single-file Python server. Two-layer scoring (single-token TF×IDF + pair co-occurrence bonus) with true d=4 D-ary heap — finds the most relevant conversation, not just a line. Search 20k+ messages with `orjson` I/O + `jieba` Chinese tokenization.
 
 ## Installation
 
@@ -13,7 +13,7 @@ Single-file Python server. Session-block scoring with true d=4 D-ary heap — fi
 git clone https://github.com/woolkingx/mcp-claude-history.git
 
 # Install dependencies
-pip install orjson mcp
+pip install orjson mcp jieba
 # or:
 pip install -e .
 
@@ -32,7 +32,7 @@ claude mcp add claude-history python3 /path/to/mcp-claude-history/server.py
 ### search_history
 
 ```
-query   — Chinese (char-level) or English (word-level) or mixed
+query   — Chinese (jieba word-level) or English (word-level) or mixed
 limit   — max results (default 3)
 since   — time window: "7d", "24h", "30m"
 project — filter by project name or cwd path substring
@@ -42,8 +42,8 @@ Returns per result:
 ```
 file    — session filename (pass to get_context)
 line    — highest-hit line in session (get_context entry point)
-hits    — total pair co-occurrence across entire session
-score   — session hits / max_possible_pairs (>1.0 = repeated co-occurrence)
+hits    — total score across entire session (single-token + pair bonus)
+score   — weighted score after D-Heap admission
 snippet — ±100 chars around the best-hit line
 ```
 
@@ -58,27 +58,26 @@ context_lines — messages before/after to include (default 5, up to 11 total)
 ## Algorithm
 
 ```python
-# 1. Tokenize: CJK → chars, English → words (max 10, deduped)
-tokens = tokenize(query)  # ["softmax", "transformer", "注", "意", "力"]
+# 1. Tokenize: CJK → jieba words, English → words (max 10, deduped)
+tokens = tokenize(query)  # ["softmax", "transformer", "注意力"]
 
 # 2. Generate token pairs (implicit Q·K)
-pairs = combinations(tokens, 2)  # C(5,2) = 10 pairs
+pairs = combinations(tokens, 2)  # C(3,2) = 3 pairs
 
-# 3. Scan each session: accumulate hits across ALL messages
+# 3. Two-layer scoring per content block
+def score_content(text, tokens, pairs, idf):
+    # Layer 1: single-token TF×IDF (×0.3) — always runs, handles 1-token queries
+    single = sum(log(1 + tf(t)) * idf[t] for t in tokens if t in text)
+    # Layer 2: pair co-occurrence bonus (×1.0) — 2+ tokens only
+    pair = sum(log(1+tf1) * log(1+tf2) * idf[t1] * idf[t2]
+               for t1, t2 in pairs if t1 in text and t2 in text)
+    return single * 0.3 + pair * 1.0
+
+# 4. Scan each session: accumulate scores across ALL messages
 for session_file in sessions:
-    session_hits = 0
-    best_line, best_hits = 1, 0
+    session_hits = sum(score_content(msg, tokens, pairs, idf) for msg in messages)
 
-    for line_num, raw in enumerate(file):
-        # bytes pre-filter: skip summary/tool/system lines without JSON parse
-        if b'"user"' not in raw and b'"assistant"' not in raw:
-            continue
-        hits = count_pair_hits(content, pairs)
-        session_hits += hits
-        if hits > best_hits:          # track densest line as entry point
-            best_line, best_hits = line_num, hits
-
-# 4. D-ary heap (d=4), bounded to `limit` entries
+# 5. D-ary heap (d=4), bounded to `limit` entries
 #    weighted_score = session_hits * dheap_weight(heap_size)
 #    → admission threshold rises as heap fills
 if len(heap) < limit:
@@ -86,7 +85,7 @@ if len(heap) < limit:
 elif weighted_score > heap[0][0]:
     _dh_replace_min(heap, (weighted_score, mtime, counter, session_item))
 
-# 5. Sort top-N by weighted_score desc, mtime desc
+# 6. Sort top-N by weighted_score desc, mtime desc
 heap.sort(key=lambda e: (-e[0], -e[1]))
 ```
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 MCP Claude History - Search Claude Code conversation history
-(D-Heap: d=4 bounded heap, dheap_weight rank decay, orjson)
+(v3.3.0: two-layer scoring — single-token TF×IDF + pair co-occurrence bonus)
 
 Usage: python server.py (stdio mode)
 """
@@ -12,6 +12,9 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from itertools import combinations
+
+import jieba
+jieba.initialize()
 
 
 # --- D-ary heap (d=4, min-heap, bounded size) ---
@@ -70,26 +73,8 @@ PROJECTS_DIR = Path.home() / '.claude/projects'
 
 
 def tokenize(text: str) -> List[str]:
-    """Tokenize: Chinese → chars, English → words"""
-    tokens = []
-    current_en = ""
-
-    for char in text:
-        if '\u4e00' <= char <= '\u9fff':
-            if current_en.strip():
-                tokens.append(current_en.strip().lower())
-                current_en = ""
-            tokens.append(char)
-        elif char.isalpha():
-            current_en += char
-        else:
-            if current_en.strip():
-                tokens.append(current_en.strip().lower())
-                current_en = ""
-
-    if current_en.strip():
-        tokens.append(current_en.strip().lower())
-
+    """Tokenize: Chinese → jieba words, English → words"""
+    tokens = [w.strip().lower() for w in jieba.cut(text) if w.strip() and not w.isspace()]
     seen = set()
     return [t for t in tokens if t and not (t in seen or seen.add(t))][:10]
 
@@ -98,11 +83,28 @@ def create_pairs(tokens: List[str]) -> List[Tuple[str, str]]:
     return list(combinations(tokens, 2))
 
 
-def count_pair_hits(text: str, pairs: List[Tuple[str, str]]) -> int:
+def score_content(text: str, tokens: List[str], pairs: List[Tuple[str, str]], idf: Dict[str, float] = {}) -> float:
+    """Two-layer scoring: single-token TF×IDF + pair co-occurrence bonus."""
     if isinstance(text, list):
         text = ' '.join(str(t) for t in text)
     text_lower = str(text).lower()
-    return sum(1 for t1, t2 in pairs if t1 in text_lower and t2 in text_lower)
+
+    # Layer 1: single-token TF×IDF (always runs, handles 1-token queries)
+    single_score = 0.0
+    for t in tokens:
+        tf = text_lower.count(t)
+        if tf > 0:
+            single_score += math.log(1 + tf) * idf.get(t, 1.0)
+
+    # Layer 2: pair co-occurrence bonus (2+ tokens only)
+    pair_score = 0.0
+    for t1, t2 in pairs:
+        if t1 in text_lower and t2 in text_lower:
+            tf1 = text_lower.count(t1)
+            tf2 = text_lower.count(t2)
+            pair_score += math.log(1 + tf1) * math.log(1 + tf2) * idf.get(t1, 1.0) * idf.get(t2, 1.0)
+
+    return single_score * 0.3 + pair_score * 1.0
 
 
 def dheap_weight(rank: int, d: int = 4) -> float:
@@ -165,20 +167,19 @@ def search_history(
     """
     tokens = tokenize(query)
     pairs = create_pairs(tokens)
-    max_pairs = len(pairs)
 
-    if max_pairs == 0:
+    if not tokens:
         return []
 
     since_ts = parse_since(since)
     project_lower = project.lower() if project else None
 
-    # Fixed-size min-heap of `limit` entries.
-    # Key: (weighted_score, mtime, counter, data)
-    # weighted_score = hits * dheap_weight(heap_size) — admission threshold rises as heap fills.
-    # Min-heap: smallest weighted_score is evicted when a better entry arrives.
-    heap = []
-    counter = 0
+    # Single-pass: collect contents + doc_count simultaneously, then re-score with precise IDF.
+    # This avoids a separate pre-scan pass while keeping full TF-log × IDF accuracy.
+    doc_count: Dict[str, int] = {t: 0 for t in tokens}
+    total_docs = 0
+    # candidate_sessions: list of (contents[], line_nums[], session_file, mtime, project_dir)
+    candidate_sessions = []
 
     for session_file in PROJECTS_DIR.glob('*/*.jsonl'):
         project_dir = session_file.parent.name
@@ -186,28 +187,26 @@ def search_history(
 
         if since_ts and mtime < since_ts:
             continue
-
         if project_lower and project_lower not in project_dir.lower():
             continue
 
-        try:
-            session_hits = 0
-            best_line = 1
-            best_hits = 0
-            best_content = ''
-            pre_filter_active = False
+        total_docs += 1
+        doc_found: set = set()
+        contents: List[str] = []
+        line_nums: List[int] = []
+        pre_filter_active = False
 
+        try:
             with open(session_file, 'rb') as f:
                 for line_num, raw in enumerate(f, 1):
                     try:
-                        # bytes pre-filter: once past the header lines, skip non-user/assistant
+                        # bytes pre-filter
                         if pre_filter_active and b'"user"' not in raw and b'"assistant"' not in raw:
                             continue
 
                         entry = orjson.loads(raw)
                         msg_type = entry.get('type')
 
-                        # activate pre-filter after first entry with cwd (past header)
                         if not pre_filter_active and entry.get('cwd'):
                             pre_filter_active = True
 
@@ -228,42 +227,69 @@ def search_history(
                                 content = text
 
                         if content:
-                            hits = count_pair_hits(content, pairs)
-                            session_hits += hits
-                            # track the line with most hits as get_context entry point
-                            if hits > best_hits:
-                                best_hits = hits
-                                best_line = line_num
-                                best_content = content
+                            text_lower = content.lower()
+                            for t in tokens:
+                                if t not in doc_found and t in text_lower:
+                                    doc_found.add(t)
+                            if any(t in text_lower for t in tokens):
+                                contents.append(content)
+                                line_nums.append(line_num)
 
                     except orjson.JSONDecodeError:
                         continue
                     except Exception:
                         continue
 
-            # score the session as a whole
-            if session_hits > 0:
-                weight = dheap_weight(len(heap))
-                weighted = session_hits * weight
-                counter += 1
-                entry_data = (
-                    weighted,
-                    mtime,
-                    counter,
-                    {
-                        'project': project_dir,
-                        'file': session_file.name,
-                        'line': best_line,
-                        'hits': session_hits,
-                        'content': best_content,
-                    }
-                )
-                if len(heap) < limit:
-                    _dh_push(heap, entry_data)
-                elif weighted > heap[0][0]:
-                    _dh_replace_min(heap, entry_data)
         except Exception:
             continue
+
+        for t in doc_found:
+            doc_count[t] += 1
+        if contents:
+            candidate_sessions.append((contents, line_nums, session_file, mtime, project_dir))
+
+    # Compute IDF now that all sessions have been scanned
+    N = max(total_docs, 1)
+    idf: Dict[str, float] = {t: math.log((N + 1) / (doc_count[t] + 1)) + 1.0 for t in tokens}
+
+    # Re-score candidates with precise TF-log × IDF, then push into D-Heap
+    heap = []
+    counter = 0
+
+    for contents, line_nums, session_file, mtime, project_dir in candidate_sessions:
+        session_hits = 0.0
+        best_line = 1
+        best_hits = 0.0
+        best_content = ''
+
+        for content, line_num in zip(contents, line_nums):
+            hits = score_content(content, tokens, pairs, idf)
+            session_hits += hits
+            if hits > best_hits:
+                best_hits = hits
+                best_line = line_num
+                best_content = content
+
+        if session_hits > 0:
+            weight = dheap_weight(len(heap))
+            weighted = session_hits * weight
+            counter += 1
+            entry_data = (
+                weighted,
+                mtime,
+                counter,
+                {
+                    'project': project_dir,
+                    'file': session_file.name,
+                    'line': best_line,
+                    'hits': session_hits,
+                    'content': best_content,
+                }
+            )
+            if len(heap) < limit:
+                _dh_push(heap, entry_data)
+            elif weighted > heap[0][0]:
+                _dh_replace_min(heap, entry_data)
 
     # heap contains at most `limit` entries; sort descending by weighted_score then mtime
     heap.sort(key=lambda e: (-e[0], -e[1]))
@@ -275,12 +301,19 @@ def search_history(
         content_lower = content.lower()
 
         best_pos = 0
-        for t1, t2 in pairs:
-            pos1 = content_lower.find(t1)
-            pos2 = content_lower.find(t2)
-            if pos1 >= 0 and pos2 >= 0:
-                best_pos = min(pos1, pos2)
-                break
+        if pairs:
+            for t1, t2 in pairs:
+                pos1 = content_lower.find(t1)
+                pos2 = content_lower.find(t2)
+                if pos1 >= 0 and pos2 >= 0:
+                    best_pos = min(pos1, pos2)
+                    break
+        if best_pos == 0:
+            for t in tokens:
+                pos = content_lower.find(t)
+                if pos >= 0:
+                    best_pos = pos
+                    break
 
         start = max(0, best_pos - 100)
         end = min(len(content), best_pos + 100)

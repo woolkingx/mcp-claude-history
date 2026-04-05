@@ -1,5 +1,27 @@
 # Changelog
 
+## v3.3.0 (2026-04-05)
+
+### Algorithm
+- Two-layer scoring replaces pair-only scoring: single-token TF×IDF (×0.3) + pair co-occurrence bonus (×1.0)
+- Single-word queries now return results (previously returned empty due to 0 pairs)
+- `score_content()` replaces `count_pair_hits()` — unified scoring function for both layers
+- Snippet extraction falls back to single-token position when no pair match found
+
+### Bug Fix
+- **Critical**: queries with 1 token (e.g. "hooks", "搜尋") no longer return empty results
+- Guard changed from `max_pairs == 0` to `not tokens` — only empty tokenization aborts
+
+## v3.2.0 (2026-03-30)
+
+### Algorithm
+- jieba tokenization for Chinese (word-level instead of char-level)
+- TF-log × IDF scoring replaces binary presence counting
+- Single-pass scan: collect contents + doc_count simultaneously, then re-score with precise IDF
+
+### Dependencies
+- Added: `jieba`
+
 ## v3.1.0 (2026-03-09)
 
 ### Algorithm
