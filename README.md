@@ -1,123 +1,103 @@
 # mcp-claude-history
 
-Lightweight MCP server for searching Claude Code conversation history.
+Your Claude Code conversations contain months of problem-solving, design decisions, and debugging sessions. This MCP server makes all of it searchable.
 
-## TL;DR
+## What you can do
 
-Single-file Python server. Two-layer scoring (single-token TF×IDF + pair co-occurrence bonus) with true d=4 D-ary heap — finds the most relevant conversation, not just a line. Search 20k+ messages with `orjson` I/O + `jieba` Chinese tokenization.
+**Find how you solved it before.** Search across all your past conversations — "how did I fix that auth bug?" or "what was the SQLite migration approach?" — and get the exact message with context.
 
-## Installation
+**Search by what happened, not just what was said.** Filter by tool usage (`tool_name=Edit`), message role (`msg_type=user`), content type (`content_type=tool_use`), git branch, or working directory. Find every time Claude edited a specific file, or every Bash command run in a project.
+
+**Navigate your work history.** Every conversation is indexed — user messages, assistant responses, tool calls and their results. Search "dheap" and find not just where you discussed it, but the actual Edit/Bash/Read calls that implemented it.
+
+**Cross-project search.** One query searches across all projects, or narrow down with `project=`, `cwd=`, or `branch=` filters.
+
+**Chinese + English.** Full CJK support via jieba tokenization. Search in Chinese, English, or mixed — "transformer 注意力" just works.
+
+## Install
 
 ```bash
-# Clone
-git clone https://github.com/woolkingx/mcp-claude-history.git
-
-# Install dependencies
 pip install orjson mcp jieba
-# or:
-pip install -e .
-
-# Add to Claude Code
-claude mcp add claude-history python3 /path/to/mcp-claude-history/server.py
+claude mcp add claude-history python3 /path/to/server.py
 ```
 
 ## Tools
 
-| Tool | Description | Parameters |
-|------|-------------|------------|
-| `search_history` | Search by token-pair co-occurrence, ranked by D-Heap | `query: str`, `limit: int = 3`, `since: str?`, `project: str?` |
-| `search_stats` | Corpus statistics (message counts, token usage, projects) | — |
-| `get_context` | Read surrounding messages around a search hit | `file: str`, `line: int`, `context_lines: int = 5` |
-
 ### search_history
 
-```
-query   — Chinese (jieba word-level) or English (word-level) or mixed
-limit   — max results (default 3)
-since   — time window: "7d", "24h", "30m"
-project — filter by project name or cwd path substring
-```
+The main search tool. 9 parameters:
 
-Returns per result:
-```
-file    — session filename (pass to get_context)
-line    — highest-hit line in session (get_context entry point)
-hits    — total score across entire session (single-token + pair bonus)
-score   — weighted score after D-Heap admission
-snippet — ±100 chars around the best-hit line
-```
+| Parameter | Example | What it does |
+|-----------|---------|-------------|
+| `query` | `"auth token refresh"` | Full-text search (required) |
+| `msg_type` | `"user"` | Only your messages, or only Claude's |
+| `content_type` | `"tool_use"` | Only tool calls, or only text, or only tool results |
+| `tool_name` | `"Edit"` | Find every Edit/Bash/Read/Write call |
+| `project` | `"firebox"` | Narrow to one project |
+| `branch` | `"dev"` | Filter by git branch |
+| `cwd` | `"/home/user/myapp"` | Filter by working directory |
+| `since` | `"7d"` | Last 7 days / 24 hours / 30 minutes |
+| `limit` | `5` | Max sessions to return |
 
 ### get_context
 
+Jump into a conversation. Pass `file` and `line` from search results to read surrounding messages — see the full discussion around a hit.
+
+### search_stats
+
+Corpus overview: total messages, token usage, tool distribution, project list.
+
+## How it works
+
+Conversations are indexed into SQLite FTS5 on startup. Each search:
+
+1. FTS5 MATCH with BM25 ranking + porter stemming (`running` finds `run`)
+2. jieba re-scoring for precise CJK token matching
+3. Recency boost — recent conversations rank higher (7-day half-life)
+4. Results grouped by session, sorted by aggregated score
+
+Index updates are incremental — only new or modified files are re-indexed.
+
+## Architecture
+
 ```
-file          — filename from search_history result
-line          — line number from search_history result
-context_lines — messages before/after to include (default 5, up to 11 total)
+~/.claude/projects/*/*.jsonl
+        |
+        v
+  [Indexer] ── startup: full scan + stale cleanup
+        |      per-search: quick scan (mtime > last_index_ts)
+        v
+  ~/.claude/history-index.db (SQLite WAL)
+        |
+        |   sessions: file_path, project, mtime, cwd, branch
+        |   messages: FTS5 (file_path, line_num, msg_type, content_type, tool_name, ts, text)
+        |   meta:     schema_version, last_index_ts
+        |
+        v
+  [Search Pipeline]
+        |
+        |   1. FTS5 MATCH (BM25 + porter stemming) ── candidate retrieval
+        |   2. jieba re-score ── precise CJK token matching
+        |   3. recency boost ── exp(-0.693 * age / 7 days)
+        |   4. score = 0.7 * BM25 + 0.3 * meet_count * (1 + recency)
+        |   5. session aggregation ── sum of message scores per session
+        |
+        v
+  List[TextContent] ── markdown output via low-level MCP SDK
 ```
 
-## Algorithm
+- Single file, no FastMCP. Python 3.10+, SQLite FTS5, jieba, orjson.
+- Schema migration: bump `DB_SCHEMA_VERSION` to force rebuild.
+- Indexed content: user text, assistant text, tool_use (name + input), tool_result (text).
 
-```python
-# 1. Tokenize: CJK → jieba words, English → words (max 10, deduped)
-tokens = tokenize(query)  # ["softmax", "transformer", "注意力"]
+## Performance
 
-# 2. Generate token pairs (implicit Q·K)
-pairs = combinations(tokens, 2)  # C(3,2) = 3 pairs
-
-# 3. Two-layer scoring per content block
-def score_content(text, tokens, pairs, idf):
-    # Layer 1: single-token TF×IDF (×0.3) — always runs, handles 1-token queries
-    single = sum(log(1 + tf(t)) * idf[t] for t in tokens if t in text)
-    # Layer 2: pair co-occurrence bonus (×1.0) — 2+ tokens only
-    pair = sum(log(1+tf1) * log(1+tf2) * idf[t1] * idf[t2]
-               for t1, t2 in pairs if t1 in text and t2 in text)
-    return single * 0.3 + pair * 1.0
-
-# 4. Scan each session: accumulate scores across ALL messages
-for session_file in sessions:
-    session_hits = sum(score_content(msg, tokens, pairs, idf) for msg in messages)
-
-# 5. D-ary heap (d=4), bounded to `limit` entries
-#    weighted_score = session_hits * dheap_weight(heap_size)
-#    → admission threshold rises as heap fills
-if len(heap) < limit:
-    _dh_push(heap, (weighted_score, mtime, counter, session_item))
-elif weighted_score > heap[0][0]:
-    _dh_replace_min(heap, (weighted_score, mtime, counter, session_item))
-
-# 6. Sort top-N by weighted_score desc, mtime desc
-heap.sort(key=lambda e: (-e[0], -e[1]))
-```
-
-**dheap_weight(k)**: rank decay — `1 / (4 ** layer)` where layer = `floor(log_4(k))`.
-Heap size 0–3 → weight 1.0. Size 4+ → weight 0.25. Later sessions need 4× hits to displace.
-
-**Why session-block**: query tokens naturally split across user/assistant turns. Line-level scoring misses cross-message relevance. Session scoring captures the full conversation signal.
-
-**Why d=4**: push-heavy workload (one push per session, few pops). `log_4(n)` sift-up layers vs `log_2(n)` in binary heap.
-
-## Why It Works
-
-| Concept | Transformer | D-Heap |
-|---------|-------------|--------|
-| Similarity | Q·K^T (explicit) | Co-occurrence (implicit) |
-| Weights | softmax(scores) | dheap_weight (rank decay) |
-| Parameters | Q, K, V matrices | Zero |
-| Complexity | O(n²) | O(n · limit) |
-
-Pair co-occurrence = implicit self-attention. Document content is the key matrix.
-
-## Use Cases
-
-1. **Recall past solutions** — find how you solved a similar problem last month
-2. **Context navigation** — jump to a specific conversation point, read surrounding messages
-3. **Code archaeology** — git shows what changed; this shows why
-4. **Cross-project search** — search across all projects, or filter by `project=`
-
-## Changelog
-
-See [CHANGELOG.md](CHANGELOG.md).
+| | |
+|---|---|
+| First index | ~35s (1000+ sessions) |
+| Search | ~0.2s |
+| Incremental update | 0.03s |
 
 ## License
 
-Public domain. Copy, modify, do whatever you want.
+Public domain.

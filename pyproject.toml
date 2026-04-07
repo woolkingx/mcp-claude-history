@@ -1,7 +1,7 @@
 [project]
 name = "mcp-claude-history"
-version = "3.3.0"
-description = "MCP server for searching Claude Code conversation history using D-Heap algorithm"
+version = "4.0.0"
+description = "MCP server for searching Claude Code conversation history — SQLite FTS5 + jieba"
 requires-python = ">=3.10"
 dependencies = [
     "mcp[cli]>=1.0.0",
@@ -14,4 +14,4 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project.scripts]
-mcp-claude-history = "server:mcp.run"
+mcp-claude-history = "server:main"
