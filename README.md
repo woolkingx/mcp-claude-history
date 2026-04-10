@@ -1,103 +1,98 @@
 # mcp-claude-history
 
-Your Claude Code conversations contain months of problem-solving, design decisions, and debugging sessions. This MCP server makes all of it searchable.
+MCP server for searching Claude Code conversation history with field-level control.
 
-## What you can do
+## Features
 
-**Find how you solved it before.** Search across all your past conversations — "how did I fix that auth bug?" or "what was the SQLite migration approach?" — and get the exact message with context.
-
-**Search by what happened, not just what was said.** Filter by tool usage (`tool_name=Edit`), message role (`msg_type=user`), content type (`content_type=tool_use`), git branch, or working directory. Find every time Claude edited a specific file, or every Bash command run in a project.
-
-**Navigate your work history.** Every conversation is indexed — user messages, assistant responses, tool calls and their results. Search "dheap" and find not just where you discussed it, but the actual Edit/Bash/Read calls that implemented it.
-
-**Cross-project search.** One query searches across all projects, or narrow down with `project=`, `cwd=`, or `branch=` filters.
-
-**Chinese + English.** Full CJK support via jieba tokenization. Search in Chinese, English, or mixed — "transformer 注意力" just works.
+- **Field-driven search**: choose which parts of messages to search
+  - `user_text` — user messages
+  - `assist_text` — assistant replies
+  - `tool_names` — tool calls (Edit, Bash, Read...)
+  - `tool_input` — tool arguments (file paths, queries)
+  - `tool_result` — tool outputs
+- **FTS5 index**: SQLite full-text search, incremental append-only updates
+- **Filters**: msg_type, tool_name, model, cwd, project, since
+- **Pair bonus**: multi-token co-occurrence scoring
+- **Dual interface**: MCP server + CLI in single file
 
 ## Install
 
 ```bash
-pip install orjson mcp jieba
-claude mcp add claude-history python3 /path/to/server.py
+pip install -e .
 ```
 
-## Tools
+Requires: Python 3.10+, orjson, mcp
 
-### search_history
+## Usage
 
-The main search tool. 9 parameters:
+### MCP Server (stdio)
 
-| Parameter | Example | What it does |
-|-----------|---------|-------------|
-| `query` | `"auth token refresh"` | Full-text search (required) |
-| `msg_type` | `"user"` | Only your messages, or only Claude's |
-| `content_type` | `"tool_use"` | Only tool calls, or only text, or only tool results |
-| `tool_name` | `"Edit"` | Find every Edit/Bash/Read/Write call |
-| `project` | `"firebox"` | Narrow to one project |
-| `branch` | `"dev"` | Filter by git branch |
-| `cwd` | `"/home/user/myapp"` | Filter by working directory |
-| `since` | `"7d"` | Last 7 days / 24 hours / 30 minutes |
-| `limit` | `5` | Max sessions to return |
+```bash
+python server.py
+```
 
-### get_context
+Add to Claude Code settings:
 
-Jump into a conversation. Pass `file` and `line` from search results to read surrounding messages — see the full discussion around a hit.
+```json
+{
+  "mcpServers": {
+    "claude-history": {
+      "command": "python",
+      "args": ["/path/to/server.py"]
+    }
+  }
+}
+```
 
-### search_stats
+### CLI
 
-Corpus overview: total messages, token usage, tool distribution, project list.
+```bash
+# Search (default: user_text + assist_text)
+python server.py "transformer attention"
 
-## How it works
+# Search specific fields
+python server.py "auth" --fields user_text
+python server.py "server.py" --fields tool_input
+python server.py "Edit" --fields tool_names
 
-Conversations are indexed into SQLite FTS5 on startup. Each search:
+# All fields (like old behavior)
+python server.py "query" --fields all
 
-1. FTS5 MATCH with BM25 ranking + porter stemming (`running` finds `run`)
-2. jieba re-scoring for precise CJK token matching
-3. Recency boost — recent conversations rank higher (7-day half-life)
-4. Results grouped by session, sorted by aggregated score
+# Filters
+python server.py "schema" --msg-type user --since 7d --project obus
 
-Index updates are incremental — only new or modified files are re-indexed.
+# Index management
+python server.py --update    # incremental update
+python server.py --rebuild   # full rebuild
+
+# Stats & context
+python server.py --stats
+python server.py --context SESSION_FILE LINE_NUM
+```
+
+## MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `search_history` | Full-text search with field + filter control |
+| `update_index` | Incremental index update (new/modified/stale) |
+| `rebuild_index` | Drop and rebuild entire index |
+| `search_stats` | Corpus statistics |
+| `get_context` | Read conversation context around a line |
+
+## Performance
+
+| Operation | Time |
+|-----------|------|
+| Index check (1200 sessions) | 0.03s |
+| Search (FTS5 + re-score) | 0.03-0.14s |
+| Append index (modified session) | 0.03s |
+| Full rebuild (1200 sessions) | ~45s |
 
 ## Architecture
 
 ```
-~/.claude/projects/*/*.jsonl
-        |
-        v
-  [Indexer] ── startup: full scan + stale cleanup
-        |      per-search: quick scan (mtime > last_index_ts)
-        v
-  ~/.claude/history-index.db (SQLite WAL)
-        |
-        |   sessions: file_path, project, mtime, cwd, branch
-        |   messages: FTS5 (file_path, line_num, msg_type, content_type, tool_name, ts, text)
-        |   meta:     schema_version, last_index_ts
-        |
-        v
-  [Search Pipeline]
-        |
-        |   1. FTS5 MATCH (BM25 + porter stemming) ── candidate retrieval
-        |   2. jieba re-score ── precise CJK token matching
-        |   3. recency boost ── exp(-0.693 * age / 7 days)
-        |   4. score = 0.7 * BM25 + 0.3 * meet_count * (1 + recency)
-        |   5. session aggregation ── sum of message scores per session
-        |
-        v
-  List[TextContent] ── markdown output via low-level MCP SDK
+JSONL files → extract_fields → SQLite FTS5 (per-field columns)
+Search → FTS5 MATCH (column filter) → str.find re-score → pair bonus → time_decay → top-K
+Index → status table (mtime + line_count) → append-only for modified files
 ```
-
-- Single file, no FastMCP. Python 3.10+, SQLite FTS5, jieba, orjson.
-- Schema migration: bump `DB_SCHEMA_VERSION` to force rebuild.
-- Indexed content: user text, assistant text, tool_use (name + input), tool_result (text).
-
-## Performance
-
-| | |
-|---|---|
-| First index | ~35s (1000+ sessions) |
-| Search | ~0.2s |
-| Incremental update | 0.03s |
-
-## License
-
-Public domain.

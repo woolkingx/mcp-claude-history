@@ -1,12 +1,11 @@
 [project]
 name = "mcp-claude-history"
-version = "4.0.0"
-description = "MCP server for searching Claude Code conversation history — SQLite FTS5 + jieba"
+version = "0.5.0"
+description = "MCP server for searching Claude Code conversation history — field-driven FTS5 search"
 requires-python = ">=3.10"
 dependencies = [
     "mcp[cli]>=1.0.0",
     "orjson>=3.0.0",
-    "jieba>=0.42",
 ]
 
 [build-system]
