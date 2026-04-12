@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.2 (2026-04-12)
+
+- Add file logging: `~/.claude/log/claude_history.log` with daily rotation (30-day retention)
+- Redirect stderr to log file
+- Log all key paths: startup, index_update, call_tool (entry/exit/error), search errors, shutdown
+- Fix: logger was declared but never used — now active on all MCP server operations
+
 ## 0.5.1 (2026-04-10)
 
 - fn-style rewrite: extract_fields split, index/search ops as pure functions

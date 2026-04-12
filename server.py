@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MCP Claude History v0.5.1 — Field-driven conversation search.
+MCP Claude History v0.5.2 — Field-driven conversation search.
 
 Architecture:
   JSONL -> extract_fields -> SQLite FTS5 (per-field columns)
@@ -14,6 +14,7 @@ Entry points:
 
 import asyncio
 import logging
+import logging.handlers
 import re
 import sqlite3
 import sys
@@ -29,6 +30,21 @@ from mcp.server.models import InitializationOptions
 import orjson
 
 logger = logging.getLogger("mcp-claude-history")
+LOG_DIR = Path.home() / ".claude" / "log"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+_file_handler = logging.handlers.TimedRotatingFileHandler(
+    str(LOG_DIR / "claude_history.log"),
+    when="midnight", backupCount=30, encoding="utf-8",
+)
+_file_handler.setFormatter(logging.Formatter(
+    '{"time":"%(asctime)s","level":"%(levelname)s","msg":"%(message)s","file":"%(filename)s:%(lineno)d"}'
+))
+logger.addHandler(_file_handler)
+logger.setLevel(logging.DEBUG)
+
+# redirect stderr to log file
+sys.stderr = open(str(LOG_DIR / "claude_history.log"), "a", encoding="utf-8")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Config
@@ -37,7 +53,7 @@ logger = logging.getLogger("mcp-claude-history")
 PROJECTS_DIR = Path.home() / ".claude/projects"
 DB_PATH = Path.home() / ".claude/history-field-index.db"
 DB_SCHEMA_VERSION = 2
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 
 ALL_FIELDS = frozenset({"user_text", "assist_text", "tool_names", "tool_input", "tool_result"})
 DEFAULT_FIELDS = frozenset({"user_text", "assist_text"})
@@ -246,6 +262,7 @@ def index_file(conn: sqlite3.Connection, fpath: str, mtime: float,
                     fld["tool_names"], fld["tool_input"], fld["tool_result"],
                 ))
     except Exception:
+        logger.exception("index_file error: %s", fpath)
         return 0
 
     if rows:
@@ -276,11 +293,13 @@ def index_update(conn: sqlite3.Connection) -> Dict:
         conn.execute("INSERT INTO messages(messages) VALUES('optimize')")
     conn.commit()
 
-    return {
+    result = {
         "new": len(status["new"]), "modified": len(status["modified"]),
         "stale": len(status["stale"]), "unchanged": len(status["unchanged"]),
         "indexed": indexed, "appended": appended,
     }
+    logger.info("index_update: %s", result)
+    return result
 
 
 def index_rebuild() -> str:
@@ -517,6 +536,7 @@ def do_search(query: str, limit: int = 10, fields: Optional[str] = None,
     try:
         rows = conn.execute(sql, params).fetchall()
     except sqlite3.OperationalError as e:
+        logger.error("search error: %s sql=%s", e, sql)
         conn.close()
         return _tc(f"Search error: {e}")
 
@@ -617,6 +637,7 @@ def do_context(file: str, line: int, context_lines: int = 5,
                 except Exception:
                     continue
     except Exception as e:
+        logger.exception("get_context error: %s", target)
         return _tc(f"Failed to read: {e}")
 
     return _tc(out)
@@ -693,6 +714,7 @@ _SEARCH_DEFAULTS = [
 
 @mcp_server.call_tool()
 async def call_tool(name: str, args: Dict[str, Any]) -> List[types.TextContent]:
+    logger.info("call_tool: %s args=%s", name, args)
     loop = asyncio.get_event_loop()
     dispatch = {
         "search_history": lambda: do_search(**{k: args.get(k, d) for k, d in _SEARCH_DEFAULTS}),
@@ -706,8 +728,15 @@ async def call_tool(name: str, args: Dict[str, Any]) -> List[types.TextContent]:
     }
     fn = dispatch.get(name)
     if not fn:
+        logger.error("unknown tool: %s", name)
         return _tc(f"Unknown tool: {name}")
-    return await loop.run_in_executor(None, fn)
+    try:
+        result = await loop.run_in_executor(None, fn)
+        logger.info("call_tool done: %s", name)
+        return result
+    except Exception:
+        logger.exception("call_tool error: %s", name)
+        raise
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -716,16 +745,20 @@ async def call_tool(name: str, args: Dict[str, Any]) -> List[types.TextContent]:
 
 
 async def run_mcp():
+    logger.info("mcp-claude-history v%s starting", VERSION)
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, lambda: (db_open(), index_update(db_open()))[0].close() or None)
+    logger.info("index ready, serving")
 
     async with mcp.server.stdio.stdio_server() as (rd, wr):
+        logger.info("stdio transport connected")
         await mcp_server.run(rd, wr, InitializationOptions(
             server_name="claude-history", server_version=VERSION,
             capabilities=mcp_server.get_capabilities(
                 notification_options=NotificationOptions(), experimental_capabilities={},
             ),
         ))
+    logger.info("server shutdown")
 
 
 def cli():

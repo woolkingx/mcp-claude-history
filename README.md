@@ -89,6 +89,13 @@ python server.py --context SESSION_FILE LINE_NUM
 | Append index (modified session) | 0.03s |
 | Full rebuild (1200 sessions) | ~45s |
 
+## Logging
+
+Server writes structured JSON logs to `~/.claude/log/claude_history.log`:
+- Daily rotation at midnight, 30-day retention
+- Logs: startup, index updates, tool calls (entry/exit/error), shutdown
+- stderr redirected to same log file
+
 ## Architecture
 
 ```
