@@ -2,8 +2,7 @@ __pycache__/
 *.pyc
 .venv/
 .claude/
+!.claude/CLAUDE.md
 .cleanup/
 .backup/
 *.log
-
-docs/
